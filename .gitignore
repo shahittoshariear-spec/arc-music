@@ -1,0 +1,22 @@
+*.iml
+.gradle/
+.idea/
+.kotlin/
+build/
+local.properties
+captures/
+.externalNativeBuild
+.cxx
+*.apk
+*.aab
+
+# Locally generated design previews
+preview-*.png
+
+# Signing material must never be committed.
+keystore.properties
+*.jks
+*.keystore
+
+# Reference APKs kept locally
+*.apkm
