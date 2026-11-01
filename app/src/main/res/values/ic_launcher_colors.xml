@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="arc_green_dark">#0E3326</color>
+    <color name="arc_green_black">#020C08</color>
+    <color name="arc_mint">#C2FFE4</color>
+    <color name="arc_emerald">#3FE6A8</color>
+    <color name="arc_teal">#17986F</color>
+</resources>

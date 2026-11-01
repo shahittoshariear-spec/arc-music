@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="arc_celestial_accent">#34D3E8</color>
+    <color name="arc_celestial_accent_gold">#FFD66E</color>
+    <color name="arc_celestial_accent_cream">#FFF8E0</color>
+    <color name="arc_celestial_accent_blue">#2A4BD7</color>
+    <color name="arc_celestial_surface">#0B2575</color>
+    <color name="arc_celestial_surface_dark">#030B22</color>
+    <color name="arc_celestial_on_surface">#F3F7FF</color>
+</resources>
