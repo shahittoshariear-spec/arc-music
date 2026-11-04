@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="arc_p3r_accent">#59F9A6</color>
+    <color name="arc_p3r_accent_blue">#1673D6</color>
+    <color name="arc_p3r_accent_cyan">#9DFCFC</color>
+    <color name="arc_p3r_surface">#000116</color>
+    <color name="arc_p3r_surface_alt">#031B2F</color>
+    <color name="arc_p3r_on_surface">#EBF4F8</color>
+</resources>
