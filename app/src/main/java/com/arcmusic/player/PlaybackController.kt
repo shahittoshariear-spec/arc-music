@@ -1,0 +1,877 @@
+package com.arcmusic.player
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.compose.runtime.Immutable
+import androidx.core.content.ContextCompat
+import com.arcmusic.data.AppTheme
+import com.arcmusic.data.SettingsRepository
+import com.arcmusic.data.StatsRepository
+import com.arcmusic.playback.PlaybackService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+
+/** One playable entry: a saved file on this phone, or a stream resolved from YouTube. */
+@Immutable
+data class PlayableTrack(
+    val key: String,
+    val title: String,
+    val artist: String?,
+    val artUrl: String?,
+    /** What the player opens: a content:// URI, a file path, or an https URL. */
+    val source: String,
+    val isLocal: Boolean,
+    val durationMs: Long = 0L,
+)
+
+enum class RepeatMode { OFF, ALL, ONE }
+
+@Immutable
+data class PlaybackState(
+    val current: PlayableTrack? = null,
+    val queue: List<PlayableTrack> = emptyList(),
+    val index: Int = -1,
+    val playing: Boolean = false,
+    val buffering: Boolean = false,
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val shuffle: Boolean = false,
+    val repeatMode: RepeatMode = RepeatMode.OFF,
+    val error: String? = null,
+) {
+    val progress: Float
+        get() = if (durationMs <= 0L) 0f else (positionMs.toFloat() / durationMs).coerceIn(0f, 1f)
+}
+
+/**
+ * The app's single ExoPlayer, plus the state the UI renders.
+ *
+ * ExoPlayer rather than MediaPlayer because background playback needs a real media
+ * session: this object is what [PlaybackService] attaches to, which is what produces
+ * the notification, lock-screen and headset controls.
+ */
+object PlaybackController {
+
+    private const val TICK_MS = 500L
+
+    /**
+     * How long a paused app may sit in the background before the player is put away.
+     * While the media session service is up the process cannot be frozen, so a queue
+     * nobody is listening to would keep the phone awake for nothing.
+     */
+    private const val IDLE_STOP_MS = 5 * 60 * 1000L
+
+    /** Covers are a few tens of KB; the cap keeps a stray file off the Binder limit. */
+    private const val MAX_ARTWORK_BYTES = 512 * 1024
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    private val _state = MutableStateFlow(PlaybackState())
+    val state: StateFlow<PlaybackState> = _state.asStateFlow()
+
+    /**
+     * Playback position, deliberately separate from [state]. A 2 Hz position update in
+     * the main state would recompose every screen that reads it; this way only the
+     * player and the mini progress bar react to the clock.
+     */
+    private val _position = MutableStateFlow(0L)
+    val position: StateFlow<Long> = _position.asStateFlow()
+
+    /** False while the app has no visible UI; the ticker is stopped entirely then. */
+    @Volatile
+    private var uiVisible = true
+
+    private var appContext: Context? = null
+    private var ticker: Job? = null
+    private var idleJob: Job? = null
+
+    /** Mirrors the player's timeline so a media id can be resolved back to a track. */
+    private val tracks = mutableListOf<PlayableTrack>()
+
+    /** Guards against counting the same start twice (queue set + transition callback). */
+    private var lastRecordedKey: String? = null
+    private var lastRecordedAt = 0L
+
+    /** The tracks whose artwork has already been embedded in the timeline. */
+    private val artworkLoaded = HashSet<String>()
+
+    /**
+     * Shuffle is applied to [tracks] itself, not to ExoPlayer's hidden shuffle order.
+     * Up Next then lists exactly what will play, in order, and "Play next" can insert
+     * right after the current song instead of somewhere inside a private order.
+     */
+    private var shuffleOn = false
+
+    /** The repeat mode, kept here so it can be set before a player exists. */
+    private var repeatOn = RepeatMode.OFF
+
+    /** The order before shuffling, so turning shuffle off restores the queue. */
+    private var baseOrder: List<PlayableTrack> = emptyList()
+
+    var player: ExoPlayer? = null
+        private set
+
+    /**
+     * Remembers the application context without paying for a player yet. Queue commands
+     * tapped from a cold start (a fresh process, nothing playing) used to fail because
+     * only [init] ever set this; the first "Play next" then had no context to build one.
+     */
+    fun prime(context: Context) {
+        if (appContext == null) appContext = context.applicationContext
+    }
+
+    fun init(context: Context): ExoPlayer? {
+        player?.let { return it }
+        val app = context.applicationContext
+        appContext = app
+
+        val attributes = AudioAttributes.Builder()
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setUsage(C.USAGE_MEDIA)
+            .build()
+
+        // A music queue needs seconds of read-ahead, not the fifty the defaults keep.
+        // The extra buffer kept memory allocated and the disk or network busy with no
+        // audible benefit, and the back buffer is pointless for a playlist that only
+        // ever moves forward.
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(20_000, 40_000, 1_000, 2_000)
+            .setBackBuffer(0, false)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+
+        val exo = ExoPlayer.Builder(app)
+            .setLoadControl(loadControl)
+            .build()
+
+        // `true` also hands audio focus to the player, so a call or another app pauses
+        // us instead of talking over us.
+        exo.setAudioAttributes(attributes, true)
+        // Restore the modes before the listener is attached: replaying a stored mode
+        // through the callback would write the same value back on every player start.
+        val settings = SettingsRepository.get(app)
+        // Our own order, not ExoPlayer's: the visible queue has to match the play order.
+        shuffleOn = settings.playbackShuffle.value
+        exo.shuffleModeEnabled = false
+        repeatOn = when (settings.playbackRepeat.value) {
+            1 -> RepeatMode.ALL
+            2 -> RepeatMode.ONE
+            else -> RepeatMode.OFF
+        }
+        exo.repeatMode = when (repeatOn) {
+            RepeatMode.OFF -> Player.REPEAT_MODE_OFF
+            RepeatMode.ALL -> Player.REPEAT_MODE_ALL
+            RepeatMode.ONE -> Player.REPEAT_MODE_ONE
+        }
+        exo.addListener(object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                publish()
+                // The position clock only has a reader while audio is moving.
+                syncTicker()
+                if (isPlaying) cancelIdleStop() else scheduleIdleStop()
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    _state.update { it.copy(error = null) }
+                }
+                publish()
+            }
+
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                publish()
+                recordPlay(mediaItem?.mediaId?.trackKey())
+            }
+
+            override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) = publish()
+
+            override fun onRepeatModeChanged(repeatMode: Int) = publish()
+
+            override fun onPlayerError(error: PlaybackException) {
+                _state.update { it.copy(error = error.message, playing = false) }
+            }
+        })
+
+        player = exo
+        _state.update { it.copy(shuffle = shuffleOn) }
+        syncTicker()
+        return exo
+    }
+
+    fun playQueue(context: Context, queue: List<PlayableTrack>, index: Int) {
+        val exo = init(context) ?: return
+        if (queue.isEmpty()) return
+
+        val start = index.coerceIn(0, queue.lastIndex)
+        baseOrder = queue
+        // Shuffle starts with the song the user tapped, then mixes the rest. The queue
+        // therefore begins at index 0 and Up Next shows the real order.
+        val ordered = if (shuffleOn) {
+            listOf(queue[start]) + queue.filterIndexed { i, _ -> i != start }.shuffled()
+        } else {
+            queue
+        }
+        val startIndex = if (shuffleOn) 0 else start
+
+        tracks.clear()
+        tracks.addAll(ordered)
+        // A fresh queue rebuilds every media item, so any artwork attached to the old
+        // ones is gone and has to be carried over again for the track that starts.
+        artworkLoaded.clear()
+
+        exo.setMediaItems(ordered.map { it.toMediaItem() }, startIndex, 0L)
+
+        // The starting cover is attached by [publish] below, off the main thread. Reading
+        // it here would put a file read (or a network fetch) on the UI thread before the
+        // first frame of the new queue.
+        exo.prepare()
+        exo.playWhenReady = true
+
+        startService(context)
+        _state.update { it.copy(error = null, positionMs = 0L) }
+        publish()
+        recordPlay(ordered[startIndex].key)
+    }
+
+    fun playTrack(context: Context, track: PlayableTrack) = playQueue(context, listOf(track), 0)
+
+    fun toggle() {
+        val exo = player
+        if (exo == null) {
+            // The player was put away while paused; rebuild it at the same spot.
+            restorePlayer()
+            return
+        }
+        if (exo.isPlaying) exo.pause() else exo.playWhenReady = true
+    }
+
+    /** Manual skip wraps, so the last track leads back to the first. */
+    fun next(context: Context) {
+        val exo = player ?: return
+        if (exo.hasNextMediaItem()) {
+            exo.seekToNextMediaItem()
+        } else if (exo.mediaItemCount > 0) {
+            exo.seekToDefaultPosition(0)
+        }
+        exo.playWhenReady = true
+    }
+
+    fun previous(context: Context) {
+        val exo = player ?: return
+        if (exo.currentPosition > 3_000L) {
+            exo.seekTo(0L)
+            return
+        }
+        if (exo.hasPreviousMediaItem()) {
+            exo.seekToPreviousMediaItem()
+        } else if (exo.mediaItemCount > 0) {
+            exo.seekToDefaultPosition(exo.mediaItemCount - 1)
+        }
+        exo.playWhenReady = true
+    }
+
+    fun seekTo(ms: Long) {
+        val position = ms.coerceAtLeast(0L)
+        player?.seekTo(position)
+        // Only the position flow is touched here. Writing the same value into [state]
+        // made every drag event publish a new snapshot, which recomposed the whole
+        // player and the tabs behind it at touch-move rate.
+        _position.value = position
+    }
+
+    /**
+     * Called by the activity. With no visible UI the ticker is stopped rather than
+     * slowed: background playback then has no timer wake-ups at all, only the player's
+     * own audio buffer schedule.
+     */
+    fun setUiVisible(visible: Boolean) {
+        uiVisible = visible
+        if (visible) {
+            cancelIdleStop()
+            val exo = player
+            if (exo != null) {
+                _position.value = exo.currentPosition.coerceAtLeast(0L)
+                publish()
+            }
+        } else {
+            scheduleIdleStop()
+        }
+        syncTicker()
+    }
+
+    fun setShuffle(enabled: Boolean) {
+        if (shuffleOn == enabled) return
+        shuffleOn = enabled
+        appContext?.let { SettingsRepository.get(it).setPlaybackShuffle(enabled) }
+        // Published before the queue rebuild: pressing shuffle before anything is
+        // playing has to light the button up, and a player-less session has no other
+        // publish to do it.
+        _state.update { it.copy(shuffle = enabled) }
+        applyShuffleOrder()
+    }
+
+    /**
+     * Rebuilds the timeline for the new shuffle state while keeping the current song and
+     * its position. ExoPlayer's own shuffle keeps its order private, which is why the
+     * queue used to look alphabetical while a shuffled list was playing.
+     */
+    private fun applyShuffleOrder() {
+        val exo = player ?: return
+        if (tracks.isEmpty()) return
+
+        val currentKey = _state.value.current?.key
+            ?: tracks.getOrNull(exo.currentMediaItemIndex.coerceAtLeast(0))?.key
+        val position = exo.currentPosition.coerceAtLeast(0L)
+        val playing = exo.playWhenReady
+
+        val ordered = if (shuffleOn) {
+            val current = tracks.firstOrNull { it.key == currentKey } ?: tracks.first()
+            listOf(current) + tracks.filterNot { it.key == current.key }.shuffled()
+        } else if (baseOrder.isEmpty()) {
+            tracks.toList()
+        } else {
+            // The songs from the original queue, in their original order, followed by
+            // anything the user queued later.
+            val restored = baseOrder.filter { candidate ->
+                tracks.any { it.key == candidate.key }
+            }
+            restored + tracks.filterNot { candidate ->
+                restored.any { it.key == candidate.key }
+            }
+        }
+
+        val index = ordered.indexOfFirst { it.key == currentKey }.coerceAtLeast(0)
+        artworkLoaded.clear()
+        tracks.clear()
+        tracks.addAll(ordered)
+        exo.setMediaItems(ordered.map { it.toMediaItem() }, index, position)
+        exo.prepare()
+        exo.playWhenReady = playing
+    }
+
+    fun cycleRepeat() {
+        repeatOn = when (repeatOn) {
+            RepeatMode.OFF -> RepeatMode.ALL
+            RepeatMode.ALL -> RepeatMode.ONE
+            RepeatMode.ONE -> RepeatMode.OFF
+        }
+        appContext?.let { SettingsRepository.get(it).setPlaybackRepeat(repeatOn.ordinal) }
+        player?.repeatMode = when (repeatOn) {
+            RepeatMode.OFF -> Player.REPEAT_MODE_OFF
+            RepeatMode.ALL -> Player.REPEAT_MODE_ALL
+            RepeatMode.ONE -> Player.REPEAT_MODE_ONE
+        }
+        _state.update { it.copy(repeatMode = repeatOn) }
+    }
+
+    fun playNext(track: PlayableTrack): Boolean {
+        val app = appContext ?: return false
+        var exo = player
+        if (exo == null || exo.mediaItemCount == 0) {
+            if (tracks.isEmpty()) {
+                // No queue at all: "play next" is the only instruction, so play it.
+                playQueue(app, listOf(track), 0)
+                return true
+            }
+            // The queue survived a paused-service teardown but its player did not.
+            // Rebuild it without resuming, so the request really is "next", not "now".
+            exo = init(app) ?: return false
+            val index = _state.value.index.coerceIn(0, tracks.lastIndex)
+            exo.setMediaItems(tracks.map { it.toMediaItem() }, index, _position.value)
+            exo.prepare()
+            exo.playWhenReady = false
+        }
+        // A stale mirror would drop the insertion at the wrong row (or off the list),
+        // which is why the request used to vanish from Up Next. Rebuild from the
+        // timeline before mutating if the two ever disagree.
+        if (tracks.size != exo.mediaItemCount) {
+            resyncTracks(exo)
+        }
+        val current = exo.currentMediaItemIndex.takeIf { it != C.INDEX_UNSET } ?: 0
+        val at = (current + 1).coerceIn(0, tracks.size)
+        val item = track.toMediaItem()
+        val added = runCatching { exo.addMediaItem(at, item) }.isSuccess
+        if (!added) {
+            publish()
+            return false
+        }
+        tracks.add(at.coerceAtMost(tracks.size), track)
+        if (baseOrder.none { it.key == track.key }) {
+            baseOrder = baseOrder + track
+        }
+        publish()
+        return true
+    }
+
+    /**
+     * Rebuilds the track mirror from the player's own timeline. The catalogue fields are
+     * not in a [MediaItem], so known keys keep their richer [PlayableTrack] and anything
+     * unknown is reconstructed from the metadata enough to keep the queue playable.
+     */
+    private fun resyncTracks(exo: ExoPlayer) {
+        val known = tracks.associateBy { it.key }
+        val rebuilt = (0 until exo.mediaItemCount).mapNotNull { index ->
+            val item = exo.getMediaItemAt(index)
+            val key = item.mediaId.trackKey()
+            if (key.isBlank()) return@mapNotNull null
+            known[key] ?: PlayableTrack(
+                key = key,
+                title = item.mediaMetadata.title?.toString().orEmpty(),
+                artist = item.mediaMetadata.artist?.toString(),
+                artUrl = item.mediaMetadata.artworkUri?.toString(),
+                source = item.localConfiguration?.uri?.toString().orEmpty(),
+                isLocal = item.localConfiguration?.uri?.scheme == "file",
+            )
+        }
+        if (rebuilt.isNotEmpty()) {
+            tracks.clear()
+            tracks.addAll(rebuilt)
+        }
+    }
+
+    fun addToQueue(track: PlayableTrack) {
+        val exo = player ?: run {
+            val app = appContext ?: return
+            playQueue(app, listOf(track), 0)
+            return
+        }
+        tracks.add(track)
+        if (baseOrder.isNotEmpty() && baseOrder.none { it.key == track.key }) {
+            baseOrder = baseOrder + track
+        }
+        runCatching { exo.addMediaItem(track.toMediaItem()) }
+        publish()
+    }
+
+    /** Starts the whole queue shuffled, picking a random first song. */
+    fun playShuffled(context: Context, queue: List<PlayableTrack>) {
+        if (queue.isEmpty()) return
+        shuffleOn = true
+        appContext?.let { SettingsRepository.get(it).setPlaybackShuffle(true) }
+        _state.update { it.copy(shuffle = true) }
+        playQueue(context, queue, kotlin.random.Random.nextInt(queue.size))
+    }
+
+    /**
+     * Drops everything after the current song. Apple Music's "Clear" in Up Next does the
+     * same, and it is the quick way out of a 400-song library queue.
+     */
+    fun clearQueue() {
+        val exo = player ?: return
+        if (tracks.isEmpty()) return
+        val index = exo.currentMediaItemIndex.coerceIn(0, tracks.lastIndex)
+        val keep = tracks[index]
+        val position = exo.currentPosition.coerceAtLeast(0L)
+        val playing = exo.playWhenReady
+        tracks.clear()
+        tracks.add(keep)
+        baseOrder = listOf(keep)
+        artworkLoaded.clear()
+        exo.setMediaItems(listOf(keep.toMediaItem()), 0, position)
+        exo.prepare()
+        exo.playWhenReady = playing
+        publish()
+    }
+
+    /**
+     * Reshuffles what is still to come, keeping the current song and the history before
+     * it. This is the "Shuffle" button in Apple Music's Up Next sheet.
+     */
+    fun shuffleUpNext() {
+        val exo = player ?: return
+        if (tracks.size <= 1) return
+        val index = exo.currentMediaItemIndex.coerceIn(0, tracks.lastIndex)
+        val position = exo.currentPosition.coerceAtLeast(0L)
+        val playing = exo.playWhenReady
+
+        val ordered = tracks.take(index) +
+            tracks[index] +
+            tracks.drop(index + 1).shuffled()
+        tracks.clear()
+        tracks.addAll(ordered)
+        artworkLoaded.clear()
+        exo.setMediaItems(ordered.map { it.toMediaItem() }, index, position)
+        exo.prepare()
+        exo.playWhenReady = playing
+        publish()
+    }
+
+    fun playFromQueue(index: Int) {
+        val exo = player ?: return
+        if (index !in tracks.indices) return
+        exo.seekToDefaultPosition(index)
+        exo.playWhenReady = true
+        publish()
+    }
+
+    fun removeFromQueue(index: Int) {
+        val exo = player ?: return
+        if (index !in tracks.indices) return
+        val removed = tracks.removeAt(index)
+        baseOrder = baseOrder.toMutableList().also { list ->
+            val at = list.indexOfFirst { it.key == removed.key }
+            if (at >= 0) list.removeAt(at)
+        }
+        exo.removeMediaItem(index)
+        publish()
+    }
+
+    /** Reorders the timeline; the player follows the media item it is currently on. */
+    fun moveQueueItem(from: Int, to: Int) {
+        val exo = player ?: return
+        if (from == to || from !in tracks.indices || to !in tracks.indices) return
+        val track = tracks.removeAt(from)
+        tracks.add(to, track)
+        runCatching { exo.moveMediaItem(from, to) }
+        publish()
+    }
+
+    fun stop() {
+        cancelIdleStop()
+        stopTicker()
+        artworkLoaded.clear()
+        player?.stop()
+        player?.clearMediaItems()
+        tracks.clear()
+        baseOrder = emptyList()
+        _state.value = PlaybackState()
+        _position.value = 0L
+    }
+
+    /**
+     * The media session service is gone. Anything still playing keeps its player;
+     * a paused one is released, because the next play can rebuild it from [tracks].
+     */
+    fun onServiceDestroyed() {
+        val exo = player ?: return
+        if (exo.isPlaying) return
+        stopTicker()
+        runCatching { exo.stop() }
+        runCatching { exo.release() }
+        player = null
+    }
+
+    /**
+     * Rebuilds the player after [onServiceDestroyed]. The queue and the clock are kept
+     * in [state], so a pause and later resume lands back where it stopped.
+     */
+    private fun restorePlayer() {
+        val app = appContext ?: return
+        if (tracks.isEmpty()) return
+        val exo = init(app) ?: return
+        val index = _state.value.index.coerceIn(0, tracks.lastIndex)
+        val position = _position.value
+        artworkLoaded.clear()
+        exo.setMediaItems(tracks.map { it.toMediaItem() }, index, position)
+        exo.prepare()
+        exo.playWhenReady = true
+        startService(app)
+    }
+
+    private fun publish() {
+        val exo = player ?: return
+        val mediaId = exo.currentMediaItem?.mediaId?.trackKey()
+        val index = tracks.indexOfFirst { it.key == mediaId }
+        val current = tracks.getOrNull(index)
+        val duration = exo.duration.takeIf { it > 0L }
+
+        _state.update {
+            // Reusing the previous list when nothing changed keeps every publish from
+            // invalidating screens that only read the queue (and saves the allocation).
+            val sameQueue = it.queue.size == tracks.size &&
+                it.queue.indices.all { index -> it.queue[index] === tracks[index] }
+            it.copy(
+                current = current ?: it.current,
+                queue = if (sameQueue) it.queue else tracks.toList(),
+                index = index,
+                playing = exo.isPlaying,
+                buffering = exo.playbackState == Player.STATE_BUFFERING,
+                durationMs = duration ?: it.durationMs,
+                positionMs = exo.currentPosition.coerceAtLeast(0L),
+                shuffle = shuffleOn,
+                repeatMode = repeatOn,
+            )
+        }
+        _position.value = exo.currentPosition.coerceAtLeast(0L)
+        attachArtwork(exo)
+    }
+
+    /**
+     * Puts the cover into the session metadata as bytes rather than a path.
+     *
+     * A `file://` cover lives in this app's private storage, which SystemUI — and so the
+     * lock screen and the OEM "dynamic island" — cannot read. Handing it a path meant
+     * those surfaces kept showing whatever artwork they already had while the title moved
+     * on. Embedded bytes are the only form every process can render.
+     *
+     * The next item is prepared as well, so the picture is already in the timeline when
+     * the track changes instead of arriving a moment later.
+     */
+    private fun attachArtwork(exo: ExoPlayer) {
+        val index = exo.currentMediaItemIndex
+        prepareArtwork(exo, index)
+        prepareArtwork(exo, index + 1)
+    }
+
+    private fun prepareArtwork(exo: ExoPlayer, position: Int) {
+        if (position < 0 || position >= exo.mediaItemCount) return
+        val item = exo.getMediaItemAt(position)
+        val key = item.mediaId
+        if (key.isBlank() || !artworkLoaded.add(key)) return
+
+        val artUrl = item.mediaMetadata.artworkUri?.toString()
+        val source = item.localConfiguration?.uri?.toString()
+        val title = item.mediaMetadata.title?.toString()
+        scope.launch {
+            val bytes = withContext(Dispatchers.IO) { artworkBytes(artUrl, source, title) }
+                ?: return@launch
+            if (position >= exo.mediaItemCount) return@launch
+            val current = exo.getMediaItemAt(position)
+            if (current.mediaId != key) return@launch
+            val metadata = current.mediaMetadata.buildUpon()
+                .setArtworkData(bytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+                .build()
+            runCatching {
+                exo.replaceMediaItem(
+                    position,
+                    current.buildUpon().setMediaMetadata(metadata).build(),
+                )
+            }
+        }
+    }
+
+    /**
+     * In order: the record's cover, the picture written into the audio file by Auto(rc),
+     * and finally a generated card. Something always reaches the notification, so a song
+     * can no longer show a blank square.
+     */
+    private fun artworkBytes(artUrl: String?, source: String?, title: String?): ByteArray? {
+        readArtwork(artUrl)?.let { return it }
+        readEmbedded(source)?.let { return it }
+        return placeholderArtwork(title)
+    }
+
+    private fun readEmbedded(source: String?): ByteArray? {
+        val context = appContext ?: return null
+        val uri = source?.let { runCatching { Uri.parse(it) }.getOrNull() } ?: return null
+        if (uri.scheme != "file" && uri.scheme != "content") return null
+        return runCatching {
+            val retriever = android.media.MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(context, uri)
+                retriever.embeddedPicture
+            } finally {
+                runCatching { retriever.release() }
+            }
+        }.getOrNull()?.takeIf { it.isNotEmpty() && it.size <= MAX_ARTWORK_BYTES }
+    }
+
+    /** A coloured card with the song's initial, for anything with no picture at all. */
+    private fun placeholderArtwork(title: String?): ByteArray? = runCatching {
+        val label = title?.trim().orEmpty().ifBlank { "A(rc)" }
+        val size = 320
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            size, size, android.graphics.Bitmap.Config.ARGB_8888,
+        )
+        val canvas = android.graphics.Canvas(bitmap)
+        val theme = appContext?.let { SettingsRepository.get(it).theme.value } ?: AppTheme.CRIMSON
+        val background = when (theme) {
+            AppTheme.EMERALD -> 0xFF0B3B2A.toInt()
+            AppTheme.OCEAN -> 0xFF0A2A45.toInt()
+            AppTheme.VIOLET -> 0xFF2A1145.toInt()
+            AppTheme.SUNSET -> 0xFF3B1E0B.toInt()
+            AppTheme.CRIMSON -> 0xFF3A0A12.toInt()
+            AppTheme.GRAPHITE -> 0xFF23262B.toInt()
+            AppTheme.P3R -> 0xFF000116.toInt()
+            AppTheme.CELESTIAL -> 0xFF050B1F.toInt()
+            AppTheme.CUSTOM -> 0xFF101418.toInt()
+        }
+        canvas.drawColor(background)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            textSize = size * 0.42f
+            textAlign = android.graphics.Paint.Align.CENTER
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        val letter = label.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "♪"
+        canvas.drawText(
+            letter,
+            size / 2f,
+            size / 2f - (paint.descent() + paint.ascent()) / 2f,
+            paint,
+        )
+        val out = java.io.ByteArrayOutputStream()
+        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, out)
+        bitmap.recycle()
+        out.toByteArray()
+    }.getOrNull()
+
+    /** Reads a cover, local or remote, with a size cap so a stray file cannot bloat the session. */
+    private fun readArtwork(rawUrl: String?): ByteArray? {
+        val url = rawUrl?.takeIf { it.isNotBlank() } ?: return null
+        val context = appContext ?: return null
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return null
+
+        fun readBounded(open: () -> java.io.InputStream?): ByteArray? = runCatching {
+            open()?.use { stream ->
+                val buffer = java.io.ByteArrayOutputStream()
+                val chunk = ByteArray(16 * 1024)
+                var total = 0
+                while (true) {
+                    val read = stream.read(chunk)
+                    if (read < 0) break
+                    total += read
+                    if (total > MAX_ARTWORK_BYTES) return@use null
+                    buffer.write(chunk, 0, read)
+                }
+                buffer.toByteArray()
+            }
+        }.getOrNull()?.takeIf { it.isNotEmpty() }
+
+        return when (uri.scheme) {
+            "file", "content" -> readBounded { context.contentResolver.openInputStream(uri) }
+            "http", "https" -> readBounded {
+                val connection = (java.net.URL(url).openConnection() as java.net.HttpURLConnection)
+                connection.connectTimeout = 5_000
+                connection.readTimeout = 5_000
+                connection.instanceFollowRedirects = true
+                connection.setRequestProperty("User-Agent", "ArcMusic/1.0")
+                connection.inputStream
+            }
+            else -> null
+        }
+    }
+
+    /** Starts the clock only when something is actually playing and on screen. */
+    private fun syncTicker() {
+        val shouldRun = uiVisible && player?.isPlaying == true
+        if (!shouldRun) {
+            stopTicker()
+            return
+        }
+        if (ticker?.isActive == true) return
+        ticker = scope.launch {
+            while (isActive) {
+                val exo = player
+                if (exo == null || !exo.isPlaying || !uiVisible) break
+                _position.value = exo.currentPosition.coerceAtLeast(0L)
+                val duration = exo.duration.takeIf { it > 0L }
+                if (duration != null) {
+                    _state.update {
+                        if (it.durationMs == duration) it else it.copy(durationMs = duration)
+                    }
+                }
+                delay(TICK_MS)
+            }
+        }
+    }
+
+    private fun stopTicker() {
+        ticker?.cancel()
+        ticker = null
+    }
+
+    /**
+     * Schedules the teardown of a paused, off-screen player. Pausing already releases
+     * the audio track; this also drops the foreground service so the OS can freeze the
+     * process, which is where a background music session costs its battery.
+     */
+    private fun scheduleIdleStop() {
+        val exo = player ?: return
+        if (uiVisible || exo.isPlaying) return
+        if (idleJob?.isActive == true) return
+        idleJob = scope.launch {
+            delay(IDLE_STOP_MS)
+            if (uiVisible || player?.isPlaying == true) return@launch
+            appContext?.let { app ->
+                runCatching { app.stopService(Intent(app, PlaybackService::class.java)) }
+            }
+        }
+    }
+
+    private fun cancelIdleStop() {
+        idleJob?.cancel()
+        idleJob = null
+    }
+
+    private fun recordPlay(key: String?) {
+        val track = tracks.firstOrNull { it.key == key } ?: return
+        val context = appContext ?: return
+        val now = System.currentTimeMillis()
+        if (key == lastRecordedKey && now - lastRecordedAt < 3_000L) return
+        lastRecordedKey = key
+        lastRecordedAt = now
+        StatsRepository.get(context).record(
+            track.key,
+            track.title,
+            track.artist,
+            track.artUrl,
+            track.durationMs / 1000L,
+        )
+    }
+
+    private fun startService(context: Context) {
+        val app = context.applicationContext
+        val intent = Intent(app, PlaybackService::class.java)
+        // A plain start carries no five-second foreground deadline, so a notification
+        // that is slow to appear can never cost the app its life — several skins kill
+        // the process when startForegroundService is used and the notification is late.
+        // The service still promotes itself in onStartCommand.
+        runCatching { app.startService(intent) }
+            .recoverCatching { ContextCompat.startForegroundService(app, intent) }
+    }
+
+    private fun PlayableTrack.toMediaItem(): MediaItem =
+        MediaItem.Builder()
+            .setMediaId(mediaId())
+            .setUri(source)
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(title)
+                    .setArtist(artist)
+                    .setArtworkUri(artUrl?.takeIf { it.isNotBlank() }?.let(Uri::parse))
+                    .setIsPlayable(true)
+                    .build()
+            )
+            .build()
+
+    /**
+     * Media ids carry a version suffix.
+     *
+     * Some OEM media panels (ColorOS, HyperOS) cache artwork by media id and never ask
+     * for it again — the same reason a cover used to freeze when the next song started.
+     * Bumping the suffix whenever the fallback artwork changes makes every one of those
+     * caches miss once, which is what finally clears a stale rose placeholder from the
+     * lock screen and the dynamic island.
+     */
+    private const val MEDIA_ID_VERSION = "|art3"
+
+    private fun PlayableTrack.mediaId(): String = key + MEDIA_ID_VERSION
+
+    private fun String.trackKey(): String = removeSuffix(MEDIA_ID_VERSION)
+
+    private fun Int.toRepeatMode(): RepeatMode = when (this) {
+        Player.REPEAT_MODE_ALL -> RepeatMode.ALL
+        Player.REPEAT_MODE_ONE -> RepeatMode.ONE
+        else -> RepeatMode.OFF
+    }
+}
