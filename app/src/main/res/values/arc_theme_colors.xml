@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="arc_emerald_accent">#45F7BC</color>
+    <color name="arc_emerald_accent_light">#CDFEEE</color>
+    <color name="arc_emerald_accent_deep">#15D595</color>
+    <color name="arc_emerald_surface">#13533E</color>
+    <color name="arc_emerald_surface_dark">#050F0C</color>
+    <color name="arc_violet_accent">#9845F7</color>
+    <color name="arc_violet_accent_light">#E4CDFE</color>
+    <color name="arc_violet_accent_deep">#6F15D5</color>
+    <color name="arc_violet_surface">#311353</color>
+    <color name="arc_violet_surface_dark">#0A050F</color>
+    <color name="arc_ocean_accent">#45A4F7</color>
+    <color name="arc_ocean_accent_light">#CDE7FE</color>
+    <color name="arc_ocean_accent_deep">#157CD5</color>
+    <color name="arc_ocean_surface">#133553</color>
+    <color name="arc_ocean_surface_dark">#050B0F</color>
+    <color name="arc_sunset_accent">#F78645</color>
+    <color name="arc_sunset_accent_light">#FEDFCD</color>
+    <color name="arc_sunset_accent_deep">#D55C15</color>
+    <color name="arc_sunset_surface">#532B13</color>
+    <color name="arc_sunset_surface_dark">#0F0905</color>
+    <color name="arc_crimson_accent">#F7455D</color>
+    <color name="arc_crimson_accent_light">#FECDD4</color>
+    <color name="arc_crimson_accent_deep">#D5152F</color>
+    <color name="arc_crimson_surface">#53131C</color>
+    <color name="arc_crimson_surface_dark">#0F0506</color>
+    <color name="arc_graphite_accent">#98A4A0</color>
+    <color name="arc_graphite_accent_light">#E4E7E6</color>
+    <color name="arc_graphite_accent_deep">#6F7C78</color>
+    <color name="arc_graphite_surface">#313534</color>
+    <color name="arc_graphite_surface_dark">#0A0B0A</color>
+</resources>
