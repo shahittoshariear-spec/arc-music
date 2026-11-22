@@ -1,0 +1,43 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <group android:translateX="18" android:translateY="18" android:scaleX="0.66667" android:scaleY="0.66667">
+        <path android:pathData="M12.00,72.00 a60.00,60.00 0 1,0 120.00,0 a60.00,60.00 0 1,0 -120.00,0 z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="radial" android:centerX="72.0" android:centerY="72.0" android:gradientRadius="60.0">
+                    <item android:offset="0" android:color="@android:color/system_neutral1_800"/>
+                    <item android:offset="0.55" android:color="@android:color/system_neutral1_900"/>
+                    <item android:offset="1" android:color="@android:color/system_neutral1_1000"/>
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path android:pathData="M42.00,72.00 a30.00,30.00 0 1,0 60.00,0 a30.00,30.00 0 1,0 -60.00,0 z M28.00,72.00 a44.00,44.00 0 1,0 88.00,0 a44.00,44.00 0 1,0 -88.00,0 z" android:strokeColor="@android:color/system_accent1_300" android:strokeAlpha="0.16" android:strokeWidth="0.9"/>
+        <path android:pathData="M72.0,72.0 L16.25,56.01 A58,58 0 0 1 43.00,21.77 Z" android:fillColor="@android:color/system_accent1_100" android:fillAlpha="0.03"/>
+        <path android:pathData="M72.0,72.0 L18.61,49.34 A58,58 0 0 1 37.09,25.68 Z" android:fillColor="@android:color/system_accent1_100" android:fillAlpha="0.03"/>
+        <path android:pathData="M72.0,72.0 L21.77,43.00 A58,58 0 0 1 31.71,30.28 Z" android:fillColor="@android:color/system_accent1_100" android:fillAlpha="0.035"/>
+        <path android:pathData="M12.90,72.00 a59.10,59.10 0 1,0 118.20,0 a59.10,59.10 0 1,0 -118.20,0 z" android:strokeColor="@android:color/system_accent1_300" android:strokeAlpha="0.95" android:strokeWidth="1.8"/>
+        <path android:pathData="M20.01,64.69 A52.5,52.5 0 0 1 91.67,23.32" android:strokeColor="@android:color/system_accent1_300" android:strokeAlpha="0.09" android:strokeWidth="17" android:strokeLineCap="round"/>
+        <path android:pathData="M20.01,64.69 A52.5,52.5 0 0 1 91.67,23.32" android:strokeColor="@android:color/system_accent1_300" android:strokeAlpha="0.14" android:strokeWidth="13" android:strokeLineCap="round"/>
+        <path android:pathData="M20.01,64.69 A52.5,52.5 0 0 1 91.67,23.32" android:strokeWidth="8.4" android:strokeLineCap="round">
+            <aapt:attr name="android:strokeColor">
+                <gradient android:type="linear" android:startX="18" android:startY="22" android:endX="90" android:endY="90">
+                    <item android:offset="0" android:color="@android:color/system_accent1_100"/>
+                    <item android:offset="0.55" android:color="@android:color/system_accent1_300"/>
+                    <item android:offset="1" android:color="@android:color/system_accent1_500"/>
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path android:pathData="M82.67,23.32 a9.00,9.00 0 1,0 18.00,0 a9.00,9.00 0 1,0 -18.00,0 z" android:fillColor="@android:color/system_accent1_300" android:fillAlpha="0.28"/>
+        <path android:pathData="M86.27,23.32 a5.40,5.40 0 1,0 10.80,0 a5.40,5.40 0 1,0 -10.80,0 z" android:fillColor="@android:color/system_accent1_100"/>
+        <path android:pathData="M56.50,72.00 a15.50,15.50 0 1,0 31.00,0 a15.50,15.50 0 1,0 -31.00,0 z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="linear" android:startX="54" android:startY="54" android:endX="92" android:endY="92">
+                    <item android:offset="0" android:color="@android:color/system_accent1_200"/>
+                    <item android:offset="1" android:color="@android:color/system_accent1_400"/>
+                </gradient>
+            </aapt:attr>
+        </path>
+        <path android:pathData="M68.60,72.00 a3.40,3.40 0 1,0 6.80,0 a3.40,3.40 0 1,0 -6.80,0 z" android:fillColor="@android:color/system_neutral1_1000"/>
+    </group>
+</vector>
